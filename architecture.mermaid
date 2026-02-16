@@ -1,0 +1,44 @@
+---
+title: ShipIt — Serverless Deploy Pipeline
+---
+sequenceDiagram
+    actor U as You (Telegram)
+    participant CW as Cloudflare Worker
+    participant GH as GitHub Actions
+    participant CC as Claude Code
+    participant V as Vercel
+
+    U->>CW: "Add Docker to skills section"
+    Note over CW: Auth check ✓<br/>Detect project: portfolio
+
+    CW->>U: 🚀 Pipeline triggered!
+    CW->>GH: repository_dispatch event
+
+    Note over GH: Runner spins up (~5s)
+
+    GH->>U: 🧠 Claude Code starting...
+    GH->>CC: Run with instruction
+    CC->>GH: Code modified ✓
+
+    GH->>U: ✅ Changes made
+
+    Note over GH: npm test --ci
+
+    alt Tests Pass
+        GH->>U: ✅ Tests passed
+    else Tests Fail
+        GH->>U: ⚠️ Auto-fixing...
+        GH->>CC: Fix based on errors
+        CC->>GH: Fixed ✓
+        Note over GH: Re-run tests
+    end
+
+    GH->>GH: git commit + push
+    GH->>U: 📤 Pushed (a3f21bc)
+
+    GH->>V: Deploy to production
+    V->>GH: Deploy success ✓
+
+    GH->>U: 🎉 Deployed! Your change is live!
+
+    Note over GH: Runner destroyed 💀<br/>Zero idle cost

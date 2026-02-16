@@ -1,0 +1,332 @@
+# ═══════════════════════════════════════════════════════════
+# ShipIt — GitHub Actions Pipeline
+# ═══════════════════════════════════════════════════════════
+#
+# This workflow is triggered by the Cloudflare Worker via repository_dispatch.
+# It runs Claude Code to make changes, tests them, commits, pushes, and deploys.
+#
+# SETUP:
+#   1. Copy this file into your project repo: .github/workflows/telegram-devops.yml
+#   2. Add these secrets in GitHub repo settings (Settings → Secrets → Actions):
+#      - ANTHROPIC_API_KEY    — From console.anthropic.com
+#      - TELEGRAM_BOT_TOKEN   — From @BotFather
+#      - GITHUB_PAT           — Personal Access Token (repo + workflow scopes)
+#      - VERCEL_TOKEN          — From vercel.com/account/tokens
+#      - VERCEL_ORG_ID         — From .vercel/project.json (run `vercel link`)
+#      - VERCEL_PROJECT_ID     — From .vercel/project.json
+
+name: 🚀 ShipIt Pipeline
+
+on:
+  repository_dispatch:
+    types: [telegram-devops]
+
+  # Also run normal CI on direct pushes
+  push:
+    branches: [main]
+
+# Cancel in-progress runs for the same ref
+concurrency:
+  group: shipit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: '20'
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+  INSTRUCTION: ${{ github.event.client_payload.instruction }}
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # JOB 1: Claude Code → Test → Push
+  # ═══════════════════════════════════════════════════════════
+  claude-code-changes:
+    name: 🧠 AI Code Change
+    runs-on: ubuntu-latest
+    if: github.event_name == 'repository_dispatch'
+
+    steps:
+      # ─── Setup ───────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_PAT }}
+          fetch-depth: 0
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      # ─── Notify: Starting ───────────────────────────────
+      - name: 📱 Notify — Claude Code starting
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"🧠 *Step 1/4: Claude Code*\nAnalyzing your codebase and making changes...\n\n\`\`\`\n${INSTRUCTION}\n\`\`\`\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      # ─── Claude Code ─────────────────────────────────────
+      - name: 🧠 Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: 🧠 Run Claude Code
+        id: claude
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          CLAUDE_OUTPUT=$(claude -p "
+          You are modifying a codebase. Make the following change:
+
+          ${INSTRUCTION}
+
+          Rules:
+          1. Only modify files that are necessary
+          2. Keep changes minimal and focused
+          3. Ensure code is syntactically correct
+          4. Do NOT run git commands
+          5. Summarize what you changed at the end
+          " --allowedTools bash,edit,write,read --output-format text 2>&1) || true
+
+          # Save output for notification
+          echo "output<<EOF" >> $GITHUB_OUTPUT
+          echo "$CLAUDE_OUTPUT" | tail -20 >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "Claude Code output:"
+          echo "$CLAUDE_OUTPUT" | tail -30
+
+      - name: 📱 Notify — Changes made
+        if: success()
+        run: |
+          SUMMARY=$(echo '${{ steps.claude.outputs.output }}' | head -10 | sed 's/"/\\"/g' | head -c 500)
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"✅ *Code Changes Made*\n\n${SUMMARY}\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      # ─── Check for Changes ──────────────────────────────
+      - name: 🔍 Check for file changes
+        id: changes
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "Changed files:"
+            git status --short
+            git diff --stat
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No changes detected"
+          fi
+
+      - name: 📱 Notify — No changes
+        if: steps.changes.outputs.has_changes == 'false'
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"⚠️ *No Changes Detected*\nClaude Code didn't modify any files. Try rephrasing your instruction.\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      # ─── Run Tests ──────────────────────────────────────
+      - name: 🧪 Run tests
+        id: tests
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          echo "::group::Test Output"
+          npm test -- --watchAll=false --ci 2>&1 | tee test-output.txt || true
+          TEST_EXIT=${PIPESTATUS[0]}
+          echo "::endgroup::"
+
+          if [ $TEST_EXIT -eq 0 ]; then
+            echo "result=passed" >> $GITHUB_OUTPUT
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+          fi
+        env:
+          CI: true
+
+      - name: 📱 Notify — Test status
+        if: steps.changes.outputs.has_changes == 'true'
+        run: |
+          if [ "${{ steps.tests.outputs.result }}" == "passed" ]; then
+            EMOJI="✅"
+            STATUS="All tests passed!"
+          else
+            EMOJI="⚠️"
+            STATUS="Tests failed — attempting auto-fix..."
+          fi
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"${EMOJI} *Step 2/4: Testing*\n${STATUS}\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      # ─── Auto-Fix if Tests Fail ─────────────────────────
+      - name: 🔧 Claude Code auto-fix
+        if: steps.tests.outputs.result == 'failed' && steps.changes.outputs.has_changes == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          TEST_ERRORS=$(cat test-output.txt | tail -30)
+          claude -p "
+          The tests failed after making changes. Here are the errors:
+
+          ${TEST_ERRORS}
+
+          Please fix the code to make the tests pass. Do NOT modify test files unless
+          the original instruction specifically asked to change tests.
+          " --allowedTools bash,edit,write,read --output-format text
+
+      - name: 🧪 Re-run tests after fix
+        id: retest
+        if: steps.tests.outputs.result == 'failed' && steps.changes.outputs.has_changes == 'true'
+        run: |
+          npm test -- --watchAll=false --ci 2>&1 || true
+          TEST_EXIT=${PIPESTATUS[0]}
+          if [ $TEST_EXIT -eq 0 ]; then
+            echo "result=passed" >> $GITHUB_OUTPUT
+          else
+            echo "result=failed" >> $GITHUB_OUTPUT
+          fi
+        env:
+          CI: true
+
+      - name: ❌ Abort if tests still fail
+        if: steps.retest.outputs.result == 'failed'
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"❌ *Pipeline Aborted*\nTests still failing after auto-fix. Check GitHub Actions logs for details.\",
+              \"parse_mode\": \"Markdown\"
+            }"
+          exit 1
+
+      # ─── Commit & Push ──────────────────────────────────
+      - name: 📤 Commit and push
+        id: push
+        if: steps.changes.outputs.has_changes == 'true' && (steps.tests.outputs.result == 'passed' || steps.retest.outputs.result == 'passed')
+        run: |
+          git config user.name "ShipIt Bot"
+          git config user.email "shipit@bot.dev"
+
+          INSTRUCTION="${{ github.event.client_payload.instruction }}"
+          SHORT_MSG="${INSTRUCTION:0:72}"
+
+          git add -A
+          git commit -m "feat: ${SHORT_MSG}
+
+          Automated change via ShipIt
+          Triggered by: ${{ github.event.client_payload.triggered_by }}
+          Instruction: ${INSTRUCTION}"
+
+          git push origin main
+
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          echo "hash=${COMMIT_HASH}" >> $GITHUB_OUTPUT
+
+      - name: 📱 Notify — Pushed
+        if: steps.push.outputs.hash
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"📤 *Step 3/4: Pushed to GitHub*\nCommit: \`${{ steps.push.outputs.hash }}\`\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+  # ═══════════════════════════════════════════════════════════
+  # JOB 2: Build & Deploy
+  # ═══════════════════════════════════════════════════════════
+  build-and-deploy:
+    name: 🚀 Build & Deploy
+    runs-on: ubuntu-latest
+    needs: [claude-code-changes]
+    if: |
+      always() &&
+      (needs.claude-code-changes.result == 'success' || github.event_name == 'push')
+
+    steps:
+      - name: 📥 Checkout latest
+        uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      - name: 🏗️ Build
+        run: npm run build
+
+      # ─── Deploy: Vercel (default) ──────────────────────
+      - name: 🚀 Deploy to Vercel
+        uses: amondnet/vercel-action@v25
+        with:
+          vercel-token: ${{ secrets.VERCEL_TOKEN }}
+          vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+          vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+          vercel-args: '--prod'
+
+      # ─── Deploy: Netlify (uncomment to use instead) ────
+      # - name: 🚀 Deploy to Netlify
+      #   uses: nwtgck/actions-netlify@v3
+      #   with:
+      #     publish-dir: './build'
+      #     production-deploy: true
+      #   env:
+      #     NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+      #     NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+
+      # ─── Deploy: GitHub Pages (uncomment to use) ───────
+      # - name: 🚀 Deploy to GitHub Pages
+      #   uses: peaceiris/actions-gh-pages@v3
+      #   with:
+      #     github_token: ${{ secrets.GITHUB_TOKEN }}
+      #     publish_dir: ./build
+
+      # ─── Final Notification ────────────────────────────
+      - name: 📱 Notify — Deployed!
+        if: github.event_name == 'repository_dispatch'
+        run: |
+          COMMIT_HASH=$(git rev-parse --short HEAD)
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"🎉 *Step 4/4: Deployed!*\n\n✅ Code changed\n✅ Tests passed\n📤 Pushed: \`${COMMIT_HASH}\`\n🚀 Deployed to production\n\n_Your change is live!_\",
+              \"parse_mode\": \"Markdown\"
+            }"
+
+      - name: ❌ Notify — Deploy failed
+        if: failure() && github.event_name == 'repository_dispatch'
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"chat_id\": \"${TELEGRAM_CHAT_ID}\",
+              \"text\": \"❌ *Deploy Failed*\nBuild or deploy step failed. Check GitHub Actions logs.\",
+              \"parse_mode\": \"Markdown\"
+            }"

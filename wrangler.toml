@@ -1,0 +1,12 @@
+name = "shipit-bot"
+main = "src/index.js"
+compatibility_date = "2024-01-01"
+
+# Secrets (set via: npx wrangler secret put SECRET_NAME)
+#
+# TELEGRAM_BOT_TOKEN       — From @BotFather on Telegram
+# GITHUB_PAT               — GitHub Personal Access Token (repo + workflow scopes)
+# ALLOWED_TELEGRAM_USER_ID — Your numeric Telegram user ID
+# PROJECTS                 — Your repos. Format: name:owner/repo:keyword1,keyword2|...
+#
+# All secrets are set automatically by ./scripts/setup.sh
