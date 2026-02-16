@@ -383,4 +383,4 @@ MIT — use it however you want.
 
 ---
 
-**Built by [Krishna](https://github.com/YOUR_USERNAME)** — Principal Engineer exploring what happens when you put AI agents between a chat message and a production deployment.
+**Built by [Krishna](https://github.com/chaitanyamean)** — Principal Engineer exploring what happens when you put AI agents between a chat message and a production deployment.
